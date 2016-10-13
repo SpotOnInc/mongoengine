@@ -1,9 +1,14 @@
 import pymongo
-from pymongo import MongoClient, MongoReplicaSetClient, uri_parser
 
+from pymongo import uri_parser
 
+# These are the "modern"client connections that we patched in for 3.3
+from pymongo.mongo_client import MongoClient
+from pymongo.mongo_replica_set_client import MongoReplicaSetClient
+
+# SpotOn
 __all__ = ['ConnectionError', 'connect', 'register_connection',
-           'DEFAULT_CONNECTION_NAME']
+           'get_connection', 'DEFAULT_CONNECTION_NAME']
 
 
 DEFAULT_CONNECTION_NAME = 'default'
@@ -115,7 +120,7 @@ def get_connection(alias=DEFAULT_CONNECTION_NAME, reconnect=False):
         connection_class = MongoClient
         if 'replicaSet' in conn_settings:
             conn_settings['hosts_or_uri'] = conn_settings.pop('host', None)
-            # Discard port since it can't be used on MongoReplicaSetClient
+            # Discard port since it can't be used on ReplicaSetConnection
             conn_settings.pop('port', None)
             # Discard replicaSet if not base string
             if not isinstance(conn_settings['replicaSet'], basestring):
@@ -137,12 +142,11 @@ def get_db(alias=DEFAULT_CONNECTION_NAME, reconnect=False):
     if alias not in _dbs:
         conn = get_connection(alias)
         conn_settings = _connection_settings[alias]
-        db = conn[conn_settings['name']]
+        _dbs[alias] = conn[conn_settings['name']]
         # Authenticate if necessary
         if conn_settings['username'] and conn_settings['password']:
-            db.authenticate(conn_settings['username'],
-                            conn_settings['password'])
-        _dbs[alias] = db
+            _dbs[alias].authenticate(conn_settings['username'],
+                                     conn_settings['password'])
     return _dbs[alias]
 
 

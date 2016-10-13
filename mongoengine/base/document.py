@@ -6,7 +6,6 @@ from functools import partial
 import pymongo
 from bson import json_util
 from bson.dbref import DBRef
-from bson.son import SON
 
 from mongoengine import signals
 from mongoengine.common import _import_class
@@ -141,17 +140,16 @@ class BaseDocument(object):
         super(BaseDocument, self).__setattr__(name, value)
 
     def __getstate__(self):
-        data = {}
-        for k in ('_changed_fields', '_initialised', '_created'):
-            data[k] = getattr(self, k)
-        data['_data'] = self.to_mongo()
-        return data
+        removals = ("get_%s_display" % k
+                    for k, v in self._fields.items() if v.choices)
+        for k in removals:
+            if hasattr(self, k):
+                delattr(self, k)
+        return self.__dict__
 
-    def __setstate__(self, data):
-        if isinstance(data["_data"], SON):
-            data["_data"] = self.__class__._from_son(data["_data"])._data
-        for k in ('_changed_fields', '_initialised', '_created', '_data'):
-            setattr(self, k, data[k])
+    def __setstate__(self, __dict__):
+        self.__dict__ = __dict__
+        self.__set_field_display()
 
     def __iter__(self):
         if 'id' in self._fields and 'id' not in self._fields_ordered:
@@ -230,16 +228,11 @@ class BaseDocument(object):
         pass
 
     def to_mongo(self):
-        """Return as SON data ready for use with MongoDB.
+        """Return data dictionary ready for use with MongoDB.
         """
-        data = SON()
-        data["_id"] = None
-        data['_cls'] = self._class_name
-
-        for field_name in self:
+        data = {}
+        for field_name, field in self._fields.iteritems():
             value = self._data.get(field_name, None)
-            field = self._fields.get(field_name)
-
             if value is not None:
                 value = field.to_mongo(value)
 
@@ -251,27 +244,19 @@ class BaseDocument(object):
             if value is not None:
                 data[field.db_field] = value
 
-        # If "_id" has not been set, then try and set it
-        if data["_id"] is None:
-            data["_id"] = self._data.get("id", None)
-
-        if data['_id'] is None:
-            data.pop('_id')
-
         # Only add _cls if allow_inheritance is True
-        if (not hasattr(self, '_meta') or
-           not self._meta.get('allow_inheritance', ALLOW_INHERITANCE)):
-            data.pop('_cls')
+        if (hasattr(self, '_meta') and
+            self._meta.get('allow_inheritance', ALLOW_INHERITANCE) == True):
+            data['_cls'] = self._class_name
+
+        if '_id' in data and data['_id'] is None:
+            del data['_id']
 
         if not self._dynamic:
             return data
 
-        # Sort dynamic fields by key
-        dynamic_fields = sorted(self._dynamic_fields.iteritems(),
-                                key=operator.itemgetter(0))
-        for name, field in dynamic_fields:
+        for name, field in self._dynamic_fields.items():
             data[name] = field.to_mongo(self._data.get(name, None))
-
         return data
 
     def validate(self, clean=True):
@@ -311,12 +296,11 @@ class BaseDocument(object):
             elif field.required and not getattr(field, '_auto_gen', False):
                 errors[field.name] = ValidationError('Field is required',
                                                      field_name=field.name)
-
         if errors:
             pk = "None"
             if hasattr(self, 'pk'):
                 pk = self.pk
-            elif self._instance:
+            elif self._instance and hasattr(self._instance, "pk"):
                 pk = self._instance.pk
             message = "ValidationError (%s:%s) " % (self._class_name, pk)
             raise ValidationError(message, errors=errors)
@@ -663,8 +647,7 @@ class BaseDocument(object):
         if include_cls and direction is not pymongo.GEO2D:
             index_list.insert(0, ('_cls', 1))
 
-        if index_list:
-            spec['fields'] = index_list
+        spec['fields'] = index_list
         if spec.get('sparse', False) and len(spec['fields']) > 1:
             raise ValueError(
                 'Sparse indexes can only have one field in them. '
@@ -706,13 +689,13 @@ class BaseDocument(object):
 
                 # Add the new index to the list
                 fields = [("%s%s" % (namespace, f), pymongo.ASCENDING)
-                          for f in unique_fields]
+                         for f in unique_fields]
                 index = {'fields': fields, 'unique': True, 'sparse': sparse}
                 unique_indexes.append(index)
 
             # Grab any embedded document field unique indexes
             if (field.__class__.__name__ == "EmbeddedDocumentField" and
-               field.document_type != cls):
+                field.document_type != cls):
                 field_namespace = "%s." % field_name
                 doc_cls = field.document_type
                 unique_indexes += doc_cls._unique_with_indexes(field_namespace)
@@ -720,31 +703,26 @@ class BaseDocument(object):
         return unique_indexes
 
     @classmethod
-    def _geo_indices(cls, inspected=None, parent_field=None):
+    def _geo_indices(cls, inspected=None):
         inspected = inspected or []
         geo_indices = []
         inspected.append(cls)
 
-        geo_field_type_names = ["EmbeddedDocumentField", "GeoPointField",
-                                "PointField", "LineStringField", "PolygonField"]
-
-        geo_field_types = tuple([_import_class(field) for field in geo_field_type_names])
+        EmbeddedDocumentField = _import_class("EmbeddedDocumentField")
+        GeoPointField = _import_class("GeoPointField")
 
         for field in cls._fields.values():
-            if not isinstance(field, geo_field_types):
+            if not isinstance(field, (EmbeddedDocumentField, GeoPointField)):
                 continue
             if hasattr(field, 'document_type'):
                 field_cls = field.document_type
                 if field_cls in inspected:
                     continue
                 if hasattr(field_cls, '_geo_indices'):
-                    geo_indices += field_cls._geo_indices(inspected, parent_field=field.db_field)
+                    geo_indices += field_cls._geo_indices(inspected)
             elif field._geo_index:
-                field_name = field.db_field
-                if parent_field:
-                    field_name = "%s.%s" % (parent_field, field_name)
                 geo_indices.append({'fields':
-                                   [(field_name, field._geo_index)]})
+                                   [(field.db_field, pymongo.GEO2D)]})
         return geo_indices
 
     @classmethod

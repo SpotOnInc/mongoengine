@@ -26,7 +26,6 @@ __all__ = ('QuerySet', 'DO_NOTHING', 'NULLIFY', 'CASCADE', 'DENY', 'PULL')
 
 # The maximum number of items to display in a QuerySet.__repr__
 REPR_OUTPUT_SIZE = 20
-ITER_CHUNK_SIZE = 100
 
 # Delete rules
 DO_NOTHING = 0
@@ -64,18 +63,16 @@ class QuerySet(object):
         self._none = False
         self._as_pymongo = False
         self._as_pymongo_coerce = False
-        self._result_cache = []
-        self._has_more = True
-        self._len = None
 
         # If inheritance is allowed, only return instances and instances of
         # subclasses of the class being used
-        if document._meta.get('allow_inheritance') is True:
+        if document._meta.get('allow_inheritance') == True:
             self._initial_query = {"_cls": {"$in": self._document._subclasses}}
             self._loaded_fields = QueryFieldList(always_include=['_cls'])
         self._cursor_obj = None
         self._limit = None
         self._skip = None
+        self._slice = None
         self._hint = -1  # Using -1 as None is a valid value for hint
 
     def __call__(self, q_obj=None, class_check=True, slave_okay=False,
@@ -113,60 +110,16 @@ class QuerySet(object):
         queryset._class_check = class_check
         return queryset
 
-    def __len__(self):
-        """Since __len__ is called quite frequently (for example, as part of
-        list(qs) we populate the result cache and cache the length.
-        """
-        if self._len is not None:
-            return self._len
-        if self._has_more:
-            # populate the cache
-            list(self._iter_results())
-
-        self._len = len(self._result_cache)
-        return self._len
-
     def __iter__(self):
-        """Iteration utilises a results cache which iterates the cursor
-        in batches of ``ITER_CHUNK_SIZE``.
+        """Support iterator protocol"""
+        queryset = self
+        if queryset._iter:
+            queryset = self.clone()
+        queryset.rewind()
+        return queryset
 
-        If ``self._has_more`` the cursor hasn't been exhausted so cache then
-        batch.  Otherwise iterate the result_cache.
-        """
-        self._iter = True
-        if self._has_more:
-            return self._iter_results()
-
-        # iterating over the cache.
-        return iter(self._result_cache)
-
-    def _iter_results(self):
-        """A generator for iterating over the result cache.
-
-        Also populates the cache if there are more possible results to yield.
-        Raises StopIteration when there are no more results"""
-        pos = 0
-        while True:
-            upper = len(self._result_cache)
-            while pos < upper:
-                yield self._result_cache[pos]
-                pos = pos + 1
-            if not self._has_more:
-                raise StopIteration
-            if len(self._result_cache) <= pos:
-                self._populate_cache()
-
-    def _populate_cache(self):
-        """
-        Populates the result cache with ``ITER_CHUNK_SIZE`` more entries
-        (until the cursor is exhausted).
-        """
-        if self._has_more:
-            try:
-                for i in xrange(ITER_CHUNK_SIZE):
-                    self._result_cache.append(self.next())
-            except StopIteration:
-                self._has_more = False
+    def __len__(self):
+        return self.count()
 
     def __getitem__(self, key):
         """Support skip and limit using getitem and slicing syntax.
@@ -177,10 +130,8 @@ class QuerySet(object):
         if isinstance(key, slice):
             try:
                 queryset._cursor_obj = queryset._cursor[key]
+                queryset._slice = key
                 queryset._skip, queryset._limit = key.start, key.stop
-                queryset._limit
-                if key.start and key.stop:
-                    queryset._limit = key.stop - key.start
             except IndexError, err:
                 # PyMongo raises an error if key.start == key.stop, catch it,
                 # bin it, kill it.
@@ -198,25 +149,32 @@ class QuerySet(object):
         elif isinstance(key, int):
             if queryset._scalar:
                 return queryset._get_scalar(
-                    queryset._document._from_son(queryset._cursor[key],
-                                                 _auto_dereference=self._auto_dereference))
+                        queryset._document._from_son(queryset._cursor[key],
+                            _auto_dereference=self._auto_dereference))
             if queryset._as_pymongo:
                 return queryset._get_as_pymongo(queryset._cursor.next())
             return queryset._document._from_son(queryset._cursor[key],
-                                                _auto_dereference=self._auto_dereference)
+                            _auto_dereference=self._auto_dereference)
         raise AttributeError
 
     def __repr__(self):
         """Provides the string representation of the QuerySet
-        """
 
+        .. versionchanged:: 0.6.13 Now doesnt modify the cursor
+        """
         if self._iter:
             return '.. queryset mid-iteration ..'
 
-        self._populate_cache()
-        data = self._result_cache[:REPR_OUTPUT_SIZE + 1]
+        data = []
+        for i in xrange(REPR_OUTPUT_SIZE + 1):
+            try:
+                data.append(self.next())
+            except StopIteration:
+                break
         if len(data) > REPR_OUTPUT_SIZE:
             data[-1] = "...(remaining elements truncated)..."
+
+        self.rewind()
         return repr(data)
 
     # Core functions
@@ -245,7 +203,7 @@ class QuerySet(object):
             result = queryset.next()
         except StopIteration:
             msg = ("%s matching query does not exist."
-                   % queryset._document._class_name)
+                    % queryset._document._class_name)
             raise queryset._document.DoesNotExist(msg)
         try:
             queryset.next()
@@ -263,7 +221,7 @@ class QuerySet(object):
         """
         return self._document(**kwargs).save()
 
-    def get_or_create(self, write_concern=None, auto_save=True,
+    def get_or_create(self, write_options=None, auto_save=True,
                       *q_objs, **query):
         """Retrieve unique object or create, if it doesn't exist. Returns a
         tuple of ``(object, created)``, where ``object`` is the retrieved or
@@ -281,9 +239,9 @@ class QuerySet(object):
             don't accidently duplicate data when using this method.  This is
             now scheduled to be removed before 1.0
 
-        :param write_concern: optional extra keyword arguments used if we
+        :param write_options: optional extra keyword arguments used if we
             have to create a new document.
-            Passes any write_concern onto :meth:`~mongoengine.Document.save`
+            Passes any write_options onto :meth:`~mongoengine.Document.save`
 
         :param auto_save: if the object is to be saved automatically if
             not found.
@@ -308,7 +266,7 @@ class QuerySet(object):
             doc = self._document(**query)
 
             if auto_save:
-                doc.save(write_concern=write_concern)
+                doc.save(write_options=write_options)
             return doc, True
 
     def first(self):
@@ -321,13 +279,18 @@ class QuerySet(object):
             result = None
         return result
 
-    def insert(self, doc_or_docs, load_bulk=True, write_concern=None):
+    def insert(self, doc_or_docs, load_bulk=True, safe=False,
+               write_options=None):
         """bulk insert documents
+
+        If ``safe=True`` and the operation is unsuccessful, an
+        :class:`~mongoengine.OperationError` will be raised.
 
         :param docs_or_doc: a document or list of documents to be inserted
         :param load_bulk (optional): If True returns the list of document
             instances
-        :param write_concern: Extra keyword arguments are passed down to
+        :param safe: check if the operation succeeded before returning
+        :param write_options: Extra keyword arguments are passed down to
                 :meth:`~pymongo.collection.Collection.insert`
                 which will be used as options for the resultant
                 ``getLastError`` command.  For example,
@@ -342,8 +305,9 @@ class QuerySet(object):
         """
         Document = _import_class('Document')
 
-        if not write_concern:
-            write_concern = {}
+        if not write_options:
+            write_options = {}
+        write_options.update({'safe': safe})
 
         docs = doc_or_docs
         return_one = False
@@ -355,7 +319,7 @@ class QuerySet(object):
         for doc in docs:
             if not isinstance(doc, self._document):
                 msg = ("Some documents inserted aren't instances of %s"
-                       % str(self._document))
+                        % str(self._document))
                 raise OperationError(msg)
             if doc.pk and not doc._created:
                 msg = "Some documents have ObjectIds use doc.update() instead"
@@ -364,7 +328,7 @@ class QuerySet(object):
 
         signals.pre_bulk_insert.send(self._document, documents=docs)
         try:
-            ids = self._collection.insert(raw, **write_concern)
+            ids = self._collection.insert(raw, **write_options)
         except pymongo.errors.OperationFailure, err:
             message = 'Could not save document (%s)'
             if re.match('^E1100[01] duplicate key', unicode(err)):
@@ -376,7 +340,7 @@ class QuerySet(object):
 
         if not load_bulk:
             signals.post_bulk_insert.send(
-                self._document, documents=docs, loaded=False)
+                    self._document, documents=docs, loaded=False)
             return return_one and ids[0] or ids
 
         documents = self.in_bulk(ids)
@@ -384,34 +348,20 @@ class QuerySet(object):
         for obj_id in ids:
             results.append(documents.get(obj_id))
         signals.post_bulk_insert.send(
-            self._document, documents=results, loaded=True)
+                self._document, documents=results, loaded=True)
         return return_one and results[0] or results
 
-    def count(self, with_limit_and_skip=True):
+    def count(self):
         """Count the selected elements in the query.
-
-        :param with_limit_and_skip (optional): take any :meth:`limit` or
-            :meth:`skip` that has been applied to this cursor into account when
-            getting the count
         """
         if self._limit == 0:
             return 0
-        if with_limit_and_skip and self._len is not None:
-            return self._len
-        count = self._cursor.count(with_limit_and_skip=with_limit_and_skip)
-        if with_limit_and_skip:
-            self._len = count
-        return count
+        return self._cursor.count(with_limit_and_skip=True)
 
-    def delete(self, write_concern=None):
+    def delete(self, safe=False):
         """Delete the documents matched by the query.
 
-        :param write_concern: Extra keyword arguments are passed down which
-            will be used as options for the resultant
-            ``getLastError`` command.  For example,
-            ``save(..., write_concern={w: 2, fsync: True}, ...)`` will
-            wait until at least two servers have recorded the write and
-            will force an fsync on the primary server.
+        :param safe: check if the operation succeeded before returning
         """
         queryset = self.clone()
         doc = queryset._document
@@ -420,14 +370,11 @@ class QuerySet(object):
             signals.pre_delete.has_receivers_for(self._document) or
             signals.post_delete.has_receivers_for(self._document))
 
-        if not write_concern:
-            write_concern = {}
-
         # Handle deletes where skips or limits have been applied or has a
         # delete signal
         if queryset._skip or queryset._limit or has_delete_signal:
             for doc in queryset:
-                doc.delete(write_concern=write_concern)
+                doc.delete(safe=safe)
             return
 
         delete_rules = doc._meta.get('delete_rules') or {}
@@ -439,7 +386,7 @@ class QuerySet(object):
             if rule == DENY and document_cls.objects(
                     **{field_name + '__in': self}).count() > 0:
                 msg = ("Could not delete document (%s.%s refers to it)"
-                       % (document_cls.__name__, field_name))
+                        % (document_cls.__name__, field_name))
                 raise OperationError(msg)
 
         for rule_entry in delete_rules:
@@ -449,38 +396,36 @@ class QuerySet(object):
                 ref_q = document_cls.objects(**{field_name + '__in': self})
                 ref_q_count = ref_q.count()
                 if (doc != document_cls and ref_q_count > 0
-                   or (doc == document_cls and ref_q_count > 0)):
-                    ref_q.delete(write_concern=write_concern)
+                    or (doc == document_cls and ref_q_count > 0)):
+                    ref_q.delete(safe=safe)
             elif rule == NULLIFY:
                 document_cls.objects(**{field_name + '__in': self}).update(
-                    write_concern=write_concern, **{'unset__%s' % field_name: 1})
+                        safe_update=safe,
+                        **{'unset__%s' % field_name: 1})
             elif rule == PULL:
                 document_cls.objects(**{field_name + '__in': self}).update(
-                    write_concern=write_concern,
-                    **{'pull_all__%s' % field_name: self})
+                        safe_update=safe,
+                        **{'pull_all__%s' % field_name: self})
 
-        queryset._collection.remove(queryset._query, write_concern=write_concern)
+        queryset._collection.remove(queryset._query, safe=safe)
 
-    def update(self, upsert=False, multi=True, write_concern=None, **update):
-        """Perform an atomic update on the fields matched by the query.
+    def update(self, safe_update=True, upsert=False, multi=True,
+               write_options=None, **update):
+        """Perform an atomic update on the fields matched by the query. When
+        ``safe_update`` is used, the number of affected documents is returned.
 
+        :param safe_update: check if the operation succeeded before returning
         :param upsert: Any existing document with that "_id" is overwritten.
-        :param multi: Update multiple documents.
-        :param write_concern: Extra keyword arguments are passed down which
-            will be used as options for the resultant
-            ``getLastError`` command.  For example,
-            ``save(..., write_concern={w: 2, fsync: True}, ...)`` will
-            wait until at least two servers have recorded the write and
-            will force an fsync on the primary server.
-        :param update: Django-style update keyword arguments
+        :param write_options: extra keyword arguments for
+            :meth:`~pymongo.collection.Collection.update`
 
         .. versionadded:: 0.2
         """
-        if not update and not upsert:
+        if not update:
             raise OperationError("No update parameters, would remove data")
 
-        if not write_concern:
-            write_concern = {}
+        if not write_options:
+            write_options = {}
 
         queryset = self.clone()
         query = queryset._query
@@ -496,7 +441,8 @@ class QuerySet(object):
 
         try:
             ret = queryset._collection.update(query, update, multi=multi,
-                                              upsert=upsert, **write_concern)
+                                              upsert=upsert, safe=safe_update,
+                                              **write_options)
             if ret is not None and 'n' in ret:
                 return ret['n']
         except pymongo.errors.OperationFailure, err:
@@ -505,22 +451,21 @@ class QuerySet(object):
                 raise OperationError(message)
             raise OperationError(u'Update failed (%s)' % unicode(err))
 
-    def update_one(self, upsert=False, write_concern=None, **update):
-        """Perform an atomic update on first field matched by the query.
+    def update_one(self, safe_update=True, upsert=False, write_options=None,
+                   **update):
+        """Perform an atomic update on first field matched by the query. When
+        ``safe_update`` is used, the number of affected documents is returned.
 
+        :param safe_update: check if the operation succeeded before returning
         :param upsert: Any existing document with that "_id" is overwritten.
-        :param write_concern: Extra keyword arguments are passed down which
-            will be used as options for the resultant
-            ``getLastError`` command.  For example,
-            ``save(..., write_concern={w: 2, fsync: True}, ...)`` will
-            wait until at least two servers have recorded the write and
-            will force an fsync on the primary server.
+        :param write_options: extra keyword arguments for
+            :meth:`~pymongo.collection.Collection.update`
         :param update: Django-style update keyword arguments
 
         .. versionadded:: 0.2
         """
-        return self.update(
-            upsert=upsert, multi=False, write_concern=write_concern, **update)
+        return self.update(safe_update=True, upsert=upsert, multi=False,
+                           write_options=None, **update)
 
     def with_id(self, object_id):
         """Retrieve the object matching the id provided.  Uses `object_id` only
@@ -553,7 +498,7 @@ class QuerySet(object):
         if self._scalar:
             for doc in docs:
                 doc_map[doc['_id']] = self._get_scalar(
-                    self._document._from_son(doc))
+                        self._document._from_son(doc))
         elif self._as_pymongo:
             for doc in docs:
                 doc_map[doc['_id']] = self._get_as_pymongo(doc)
@@ -569,15 +514,6 @@ class QuerySet(object):
         queryset._none = True
         return queryset
 
-    def no_sub_classes(self):
-        """
-        Only return instances of this document and not any inherited documents
-        """
-        if self._document._meta.get('allow_inheritance') is True:
-            self._initial_query = {"_cls": self._document._class_name}
-
-        return self
-
     def clone(self):
         """Creates a copy of the current
           :class:`~mongoengine.queryset.QuerySet`
@@ -587,24 +523,29 @@ class QuerySet(object):
         c = self.__class__(self._document, self._collection_obj)
 
         copy_props = ('_mongo_query', '_initial_query', '_none', '_query_obj',
-                      '_where_clause', '_loaded_fields', '_ordering', '_snapshot',
-                      '_timeout', '_class_check', '_slave_okay', '_read_preference',
-                      '_iter', '_scalar', '_as_pymongo', '_as_pymongo_coerce',
-                      '_limit', '_skip', '_hint', '_auto_dereference')
+            '_where_clause', '_loaded_fields', '_ordering', '_snapshot',
+            '_timeout', '_class_check', '_slave_okay', '_read_preference',
+            '_iter', '_scalar', '_as_pymongo', '_as_pymongo_coerce',
+            '_limit', '_skip', '_hint', '_auto_dereference')
 
         for prop in copy_props:
             val = getattr(self, prop)
             setattr(c, prop, copy.copy(val))
 
+        if self._slice:
+            c._slice = self._slice
+
         if self._cursor_obj:
             c._cursor_obj = self._cursor_obj.clone()
+
+        if self._slice:
+            c._cursor[self._slice]
 
         return c
 
     def select_related(self, max_depth=1):
-        """Handles dereferencing of :class:`~bson.dbref.DBRef` objects or
-        :class:`~bson.object_id.ObjectId` a maximum depth in order to cut down
-        the number queries to mongodb.
+        """Handles dereferencing of :class:`~bson.dbref.DBRef` objects to
+        a maximum depth in order to cut down the number queries to mongodb.
 
         .. versionadded:: 0.5
         """
@@ -625,6 +566,7 @@ class QuerySet(object):
         else:
             queryset._cursor.limit(n)
         queryset._limit = n
+
         # Return self to allow chaining
         return queryset
 
@@ -662,9 +604,6 @@ class QuerySet(object):
 
         :param field: the field to select distinct values from
 
-        .. note:: This is a command and won't take ordering or limit into
-           account.
-
         .. versionadded:: 0.4
         .. versionchanged:: 0.5 - Fixed handling references
         .. versionchanged:: 0.6 - Improved db_field refrence handling
@@ -681,34 +620,18 @@ class QuerySet(object):
 
             post = BlogPost.objects(...).only("title", "author.name")
 
-        .. note :: `only()` is chainable and will perform a union ::
-            So with the following it will fetch both: `title` and `author.name`::
-
-                post = BlogPost.objects.only("title").only("author.name")
-
-        :func:`~mongoengine.queryset.QuerySet.all_fields` will reset any
-        field filters.
-
         :param fields: fields to include
 
         .. versionadded:: 0.3
         .. versionchanged:: 0.5 - Added subfield support
         """
         fields = dict([(f, QueryFieldList.ONLY) for f in fields])
-        return self.fields(True, **fields)
+        return self.fields(**fields)
 
     def exclude(self, *fields):
         """Opposite to .only(), exclude some document's fields. ::
 
             post = BlogPost.objects(...).exclude("comments")
-
-        .. note :: `exclude()` is chainable and will perform a union ::
-            So with the following it will exclude both: `title` and `author.name`::
-
-                post = BlogPost.objects.exclude("title").exclude("author.name")
-
-        :func:`~mongoengine.queryset.QuerySet.all_fields` will reset any
-        field filters.
 
         :param fields: fields to exclude
 
@@ -717,7 +640,7 @@ class QuerySet(object):
         fields = dict([(f, QueryFieldList.EXCLUDE) for f in fields])
         return self.fields(**fields)
 
-    def fields(self, _only_called=False, **kwargs):
+    def fields(self, **kwargs):
         """Manipulate how you load this document's fields.  Used by `.only()`
         and `.exclude()` to manipulate which fields to retrieve.  Fields also
         allows for a greater level of control for example:
@@ -751,8 +674,7 @@ class QuerySet(object):
         for value, group in itertools.groupby(fields, lambda x: x[1]):
             fields = [field for field, value in group]
             fields = queryset._fields_to_dbfields(fields)
-            queryset._loaded_fields += QueryFieldList(fields, value=value, _only_called=_only_called)
-
+            queryset._loaded_fields += QueryFieldList(fields, value=value)
         return queryset
 
     def all_fields(self):
@@ -876,7 +798,8 @@ class QuerySet(object):
 
     def to_json(self):
         """Converts a queryset to JSON"""
-        return json_util.dumps(self.as_pymongo())
+        queryset = self.clone()
+        return json_util.dumps(queryset._collection_obj.find(queryset._query))
 
     def from_json(self, json_data):
         """Converts json data to unsaved objects"""
@@ -968,7 +891,7 @@ class QuerySet(object):
             mr_args['out'] = output
 
         results = getattr(queryset._collection, map_reduce_function)(
-                          map_f, reduce_f, **mr_args)
+                            map_f, reduce_f, **mr_args)
 
         if map_reduce_function == 'map_reduce':
             results = results.find()
@@ -1105,7 +1028,7 @@ class QuerySet(object):
         """)
 
         for result in self.map_reduce(map_func, reduce_func,
-                                      finalize_f=finalize_func, output='inline'):
+                            finalize_f=finalize_func, output='inline'):
             return result.value
         else:
             return 0
@@ -1118,11 +1041,11 @@ class QuerySet(object):
         .. note::
 
             Can only do direct simple mappings and cannot map across
-            :class:`~mongoengine.fields.ReferenceField` or
-            :class:`~mongoengine.fields.GenericReferenceField` for more complex
+            :class:`~mongoengine.ReferenceField` or
+            :class:`~mongoengine.GenericReferenceField` for more complex
             counting a manual map reduce call would is required.
 
-        If the field is a :class:`~mongoengine.fields.ListField`, the items within
+        If the field is a :class:`~mongoengine.ListField`, the items within
         each list will be counted individually.
 
         :param field: the field to use
@@ -1142,18 +1065,22 @@ class QuerySet(object):
     def next(self):
         """Wrap the result in a :class:`~mongoengine.Document` object.
         """
-        if self._limit == 0 or self._none:
-            raise StopIteration
-
-        raw_doc = self._cursor.next()
-        if self._as_pymongo:
-            return self._get_as_pymongo(raw_doc)
-
-        doc = self._document._from_son(raw_doc)
-        if self._scalar:
-            return self._get_scalar(doc)
-
-        return doc
+        self._iter = True
+        _next = None
+        try:
+            if self._limit == 0 or self._none:
+                raise StopIteration
+            if self._scalar:
+                return self._get_scalar(self._document._from_son(
+                        self._cursor.next()))
+            if self._as_pymongo:
+                return self._get_as_pymongo(self._cursor.next())
+            _next = self._cursor.next()
+            return self._document._from_son(_next)
+        except StopIteration, e:
+            self.rewind()
+            raise e
+            print _next
 
     def rewind(self):
         """Rewind the cursor to its unevaluated state.
@@ -1206,7 +1133,7 @@ class QuerySet(object):
                 self._cursor_obj.sort(order)
 
             if self._limit is not None:
-                self._cursor_obj.limit(self._limit)
+                self._cursor_obj.limit(self._limit - (self._skip or 0))
 
             if self._skip is not None:
                 self._cursor_obj.skip(self._skip)
@@ -1421,15 +1348,7 @@ class QuerySet(object):
                 new_data = {}
                 for key, value in data.iteritems():
                     new_path = '%s.%s' % (path, key) if path else key
-
-                    if all_fields:
-                        include_field = True
-                    elif self._loaded_fields.value == QueryFieldList.ONLY:
-                        include_field = new_path in self.__as_pymongo_fields
-                    else:
-                        include_field = new_path not in self.__as_pymongo_fields
-
-                    if include_field:
+                    if all_fields or new_path in self.__as_pymongo_fields:
                         new_data[key] = clean(value, path=new_path)
                 data = new_data
             elif isinstance(data, list):
@@ -1474,14 +1393,15 @@ class QuerySet(object):
 
         code = re.sub(u'\[\s*~([A-z_][A-z_0-9.]+?)\s*\]', field_sub, code)
         code = re.sub(u'\{\{\s*~([A-z_][A-z_0-9.]+?)\s*\}\}', field_path_sub,
-                      code)
+                code)
         return code
 
     # Deprecated
+
     def ensure_index(self, **kwargs):
         """Deprecated use :func:`~Document.ensure_index`"""
         msg = ("Doc.objects()._ensure_index() is deprecated. "
-               "Use Doc.ensure_index() instead.")
+              "Use Doc.ensure_index() instead.")
         warnings.warn(msg, DeprecationWarning)
         self._document.__class__.ensure_index(**kwargs)
         return self
@@ -1489,6 +1409,6 @@ class QuerySet(object):
     def _ensure_indexes(self):
         """Deprecated use :func:`~Document.ensure_indexes`"""
         msg = ("Doc.objects()._ensure_indexes() is deprecated. "
-               "Use Doc.ensure_indexes() instead.")
+              "Use Doc.ensure_indexes() instead.")
         warnings.warn(msg, DeprecationWarning)
         self._document.__class__.ensure_indexes()

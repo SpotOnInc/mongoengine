@@ -140,31 +140,8 @@ class DocumentMetaclass(type):
                 base._subclasses += (_cls,)
             base._types = base._subclasses   # TODO depreciate _types
 
-        Document, EmbeddedDocument, DictField = cls._import_classes()
-
-        if issubclass(new_class, Document):
-            new_class._collection = None
-
-        # Add class to the _document_registry
-        _document_registry[new_class._class_name] = new_class
-
-        # In Python 2, User-defined methods objects have special read-only
-        # attributes 'im_func' and 'im_self' which contain the function obj
-        # and class instance object respectively.  With Python 3 these special
-        # attributes have been replaced by __func__ and __self__.  The Blinker
-        # module continues to use im_func and im_self, so the code below
-        # copies __func__ into im_func and __self__ into im_self for
-        # classmethod objects in Document derived classes.
-        if PY3:
-            for key, val in new_class.__dict__.items():
-                if isinstance(val, classmethod):
-                    f = val.__get__(new_class)
-                    if hasattr(f, '__func__') and not hasattr(f, 'im_func'):
-                        f.__dict__.update({'im_func': getattr(f, '__func__')})
-                    if hasattr(f, '__self__') and not hasattr(f, 'im_self'):
-                        f.__dict__.update({'im_self': getattr(f, '__self__')})
-
         # Handle delete rules
+        Document, EmbeddedDocument, DictField = cls._import_classes()
         for field in new_class._fields.itervalues():
             f = field
             f.owner_document = new_class
@@ -190,10 +167,32 @@ class DocumentMetaclass(type):
                                                      field.name, delete_rule)
 
             if (field.name and hasattr(Document, field.name) and
-               EmbeddedDocument not in new_class.mro()):
+                EmbeddedDocument not in new_class.mro()):
                 msg = ("%s is a document method and not a valid "
                        "field name" % field.name)
                 raise InvalidDocumentError(msg)
+
+        if issubclass(new_class, Document):
+            new_class._collection = None
+
+        # Add class to the _document_registry
+        _document_registry[new_class._class_name] = new_class
+
+        # In Python 2, User-defined methods objects have special read-only
+        # attributes 'im_func' and 'im_self' which contain the function obj
+        # and class instance object respectively.  With Python 3 these special
+        # attributes have been replaced by __func__ and __self__.  The Blinker
+        # module continues to use im_func and im_self, so the code below
+        # copies __func__ into im_func and __self__ into im_self for
+        # classmethod objects in Document derived classes.
+        if PY3:
+            for key, val in new_class.__dict__.items():
+                if isinstance(val, classmethod):
+                    f = val.__get__(new_class)
+                    if hasattr(f, '__func__') and not hasattr(f, 'im_func'):
+                        f.__dict__.update({'im_func': getattr(f, '__func__')})
+                    if hasattr(f, '__self__') and not hasattr(f, 'im_self'):
+                        f.__dict__.update({'im_self': getattr(f, '__self__')})
 
         return new_class
 
@@ -316,8 +315,8 @@ class TopLevelDocumentMetaclass(DocumentMetaclass):
         # may set allow_inheritance to False
         simple_class = all([b._meta.get('abstract')
                             for b in flattened_bases if hasattr(b, '_meta')])
-        if (not simple_class and meta['allow_inheritance'] is False and
-           not meta['abstract']):
+        if (not simple_class and meta['allow_inheritance'] == False and
+            not meta['abstract']):
             raise ValueError('Only direct subclasses of Document may set '
                              '"allow_inheritance" to False')
 
@@ -340,9 +339,9 @@ class TopLevelDocumentMetaclass(DocumentMetaclass):
         if callable(collection):
             new_class._meta['collection'] = collection(new_class)
 
-        # Provide a default queryset unless exists or one has been set
-        if 'objects' not in dir(new_class):
-            new_class.objects = QuerySetManager()
+        # Provide a default queryset unless one has been set
+        manager = attrs.get('objects', QuerySetManager())
+        new_class.objects = manager
 
         # Validate the fields and set primary key if needed
         for field_name, field in new_class._fields.iteritems():

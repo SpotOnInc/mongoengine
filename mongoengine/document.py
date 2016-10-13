@@ -1,3 +1,4 @@
+from __future__ import with_statement
 import warnings
 
 import pymongo
@@ -141,7 +142,7 @@ class Document(BaseDocument):
                        options.get('size') != max_size:
                         msg = (('Cannot create collection "%s" as a capped '
                                'collection as it already exists')
-                               % cls._collection)
+                                % cls._collection)
                         raise InvalidCollectionError(msg)
                 else:
                     # Create the collection as a capped collection
@@ -157,24 +158,28 @@ class Document(BaseDocument):
                 cls.ensure_indexes()
         return cls._collection
 
-    def save(self, force_insert=False, validate=True, clean=True,
-             write_concern=None,  cascade=None, cascade_kwargs=None,
+    def save(self, safe=True, force_insert=False, validate=True, clean=True,
+             write_options=None,  cascade=None, cascade_kwargs=None,
              _refs=None, **kwargs):
         """Save the :class:`~mongoengine.Document` to the database. If the
         document already exists, it will be updated, otherwise it will be
         created.
 
+        If ``safe=True`` and the operation is unsuccessful, an
+        :class:`~mongoengine.OperationError` will be raised.
+
+        :param safe: check if the operation succeeded before returning
         :param force_insert: only try to create a new document, don't allow
             updates of existing documents
         :param validate: validates the document; set to ``False`` to skip.
         :param clean: call the document clean method, requires `validate` to be
             True.
-        :param write_concern: Extra keyword arguments are passed down to
+        :param write_options: Extra keyword arguments are passed down to
             :meth:`~pymongo.collection.Collection.save` OR
             :meth:`~pymongo.collection.Collection.insert`
             which will be used as options for the resultant
             ``getLastError`` command.  For example,
-            ``save(..., write_concern={w: 2, fsync: True}, ...)`` will
+            ``save(..., write_options={w: 2, fsync: True}, ...)`` will
             wait until at least two servers have recorded the write and
             will force an fsync on the primary server.
         :param cascade: Sets the flag for cascading saves.  You can set a
@@ -200,8 +205,8 @@ class Document(BaseDocument):
         if validate:
             self.validate(clean=clean)
 
-        if not write_concern:
-            write_concern = {}
+        if not write_options:
+            write_options = {}
 
         doc = self.to_mongo()
 
@@ -211,9 +216,11 @@ class Document(BaseDocument):
             collection = self._get_collection()
             if created:
                 if force_insert:
-                    object_id = collection.insert(doc, **write_concern)
+                    object_id = collection.insert(doc, safe=safe,
+                                                  **write_options)
                 else:
-                    object_id = collection.save(doc, **write_concern)
+                    object_id = collection.save(doc, safe=safe,
+                                                **write_options)
             else:
                 object_id = doc['_id']
                 updates, removals = self._delta()
@@ -231,6 +238,7 @@ class Document(BaseDocument):
                             return not updated
                     return created
 
+                upsert = self._created
                 update_query = {}
 
                 if updates:
@@ -239,22 +247,24 @@ class Document(BaseDocument):
                     update_query["$unset"] = removals
                 if updates or removals:
                     last_error = collection.update(select_dict, update_query,
-                                                   upsert=True, **write_concern)
+                                    upsert=upsert, safe=safe, **write_options)
                     created = is_new_object(last_error)
 
+            warn_cascade = not cascade and 'cascade' not in self._meta
             cascade = (self._meta.get('cascade', True)
                        if cascade is None else cascade)
             if cascade:
                 kwargs = {
+                    "safe": safe,
                     "force_insert": force_insert,
                     "validate": validate,
-                    "write_concern": write_concern,
+                    "write_options": write_options,
                     "cascade": cascade
                 }
                 if cascade_kwargs:  # Allow granular control over cascades
                     kwargs.update(cascade_kwargs)
                 kwargs['_refs'] = _refs
-                self.cascade_save(**kwargs)
+                self.cascade_save(warn_cascade=warn_cascade, **kwargs)
 
         except pymongo.errors.OperationFailure, err:
             message = 'Could not save document (%s)'
@@ -273,7 +283,7 @@ class Document(BaseDocument):
         signals.post_save.send(self.__class__, document=self, created=created)
         return self
 
-    def cascade_save(self, *args, **kwargs):
+    def cascade_save(self, warn_cascade=None, *args, **kwargs):
         """Recursively saves any references /
            generic references on an objects"""
         import fields
@@ -293,6 +303,10 @@ class Document(BaseDocument):
 
             ref_id = "%s,%s" % (ref.__class__.__name__, str(ref._data))
             if ref and ref_id not in _refs:
+                if warn_cascade:
+                    msg = ("Cascading saves will default to off in 0.8, "
+                          "please  explicitly set `.save(cascade=True)`")
+                    warnings.warn(msg, FutureWarning)
                 _refs.append(ref_id)
                 kwargs["_refs"] = _refs
                 ref.save(**kwargs)
@@ -330,21 +344,16 @@ class Document(BaseDocument):
         # Need to add shard key to query, or you get an error
         return self._qs.filter(**self._object_key).update_one(**kwargs)
 
-    def delete(self, **write_concern):
+    def delete(self, safe=False):
         """Delete the :class:`~mongoengine.Document` from the database. This
         will only take effect if the document has been previously saved.
 
-        :param write_concern: Extra keyword arguments are passed down which
-            will be used as options for the resultant
-            ``getLastError`` command.  For example,
-            ``save(..., write_concern={w: 2, fsync: True}, ...)`` will
-            wait until at least two servers have recorded the write and
-            will force an fsync on the primary server.
+        :param safe: check if the operation succeeded before returning
         """
         signals.pre_delete.send(self.__class__, document=self)
 
         try:
-            self._qs.filter(**self._object_key).delete(write_concern=write_concern)
+            self._qs.filter(**self._object_key).delete(safe=safe)
         except pymongo.errors.OperationFailure, err:
             message = u'Could not delete document (%s)' % err.message
             raise OperationError(message)
@@ -388,7 +397,7 @@ class Document(BaseDocument):
             user.save()
 
         If you need to read from another database see
-        :class:`~mongoengine.context_managers.switch_db`
+        :class:`~mongoengine.context_managers.switch_collection`
 
         :param collection_name: The database alias to use for saving the
             document
@@ -412,6 +421,7 @@ class Document(BaseDocument):
         self._data = dereference.DeReference()(self._data, max_depth)
         return self
 
+    # SPOTON: Added class_check=False - Jim 8/29/2013
     def reload(self, max_depth=1):
         """Reloads all attributes from the database.
 
@@ -419,8 +429,9 @@ class Document(BaseDocument):
         .. versionchanged:: 0.6  Now chainable
         """
         id_field = self._meta['id_field']
-        obj = self._qs.filter(**{id_field: self[id_field]}
-                              ).limit(1).select_related(max_depth=max_depth)
+        obj = self._qs.filter(
+                **{id_field: self[id_field], 'class_check': False}
+              ).limit(1).select_related(max_depth=max_depth)
         if obj:
             obj = obj[0]
         else:
@@ -521,6 +532,7 @@ class Document(BaseDocument):
         # an extra index on _cls, as mongodb will use the existing
         # index to service queries against _cls
         cls_indexed = False
+
         def includes_cls(fields):
             first_field = None
             if len(fields):
@@ -545,7 +557,7 @@ class Document(BaseDocument):
         # If _cls is being used (for polymorphism), it needs an index,
         # only if another index doesn't begin with _cls
         if (index_cls and not cls_indexed and
-           cls._meta.get('allow_inheritance', ALLOW_INHERITANCE) is True):
+            cls._meta.get('allow_inheritance', ALLOW_INHERITANCE) == True):
             collection.ensure_index('_cls', background=background,
                                     **index_opts)
 
@@ -556,7 +568,7 @@ class DynamicDocument(Document):
     way as an ordinary document but has expando style properties.  Any data
     passed or set against the :class:`~mongoengine.DynamicDocument` that is
     not a field is automatically converted into a
-    :class:`~mongoengine.fields.DynamicField` and data can be attributed to that
+    :class:`~mongoengine.DynamicField` and data can be attributed to that
     field.
 
     .. note::

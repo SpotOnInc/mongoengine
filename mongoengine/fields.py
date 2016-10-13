@@ -4,19 +4,19 @@ import itertools
 import re
 import time
 import urllib2
+import urlparse
 import uuid
 import warnings
 from operator import itemgetter
 
-import pymongo
 import gridfs
 from bson import Binary, DBRef, SON, ObjectId
 
 from mongoengine.errors import ValidationError
 from mongoengine.python_support import (PY3, bin_type, txt_type,
                                         str_types, StringIO)
-from base import (BaseField, ComplexBaseField, ObjectIdField, GeoJsonBaseField,
-                  get_document, BaseDocument)
+from base import (BaseField, ComplexBaseField, ObjectIdField,
+                  get_document, BaseDocument, ALLOW_INHERITANCE)
 from queryset import DO_NOTHING, QuerySet
 from document import Document, EmbeddedDocument
 from connection import get_db, DEFAULT_CONNECTION_NAME
@@ -27,16 +27,13 @@ except ImportError:
     Image = None
     ImageOps = None
 
-__all__ = ['StringField',  'URLField',  'EmailField',  'IntField',  'LongField',
-           'FloatField',  'DecimalField',  'BooleanField',  'DateTimeField',
-           'ComplexDateTimeField',  'EmbeddedDocumentField', 'ObjectIdField',
-           'GenericEmbeddedDocumentField',  'DynamicField',  'ListField',
-           'SortedListField',  'DictField',  'MapField',  'ReferenceField',
-           'GenericReferenceField',  'BinaryField',  'GridFSError',
-           'GridFSProxy',  'FileField',  'ImageGridFsProxy',
-           'ImproperlyConfigured',  'ImageField',  'GeoPointField', 'PointField',
-           'LineStringField', 'PolygonField', 'SequenceField',  'UUIDField']
-
+__all__ = ['StringField', 'IntField', 'LongField', 'FloatField', 'BooleanField',
+           'DateTimeField', 'EmbeddedDocumentField', 'ListField', 'DictField',
+           'ObjectIdField', 'ReferenceField', 'ValidationError', 'MapField',
+           'DecimalField', 'ComplexDateTimeField', 'URLField', 'DynamicField',
+           'GenericReferenceField', 'FileField', 'BinaryField',
+           'SortedListField', 'EmailField', 'GeoPointField', 'ImageField',
+           'SequenceField', 'UUIDField', 'GenericEmbeddedDocumentField']
 
 RECURSIVE_REFERENCE_CONSTANT = 'self'
 
@@ -107,11 +104,11 @@ class URLField(StringField):
     """
 
     _URL_REGEX = re.compile(
-        r'^(?:http|ftp)s?://'  # http:// or https://
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'  # domain...
-        r'localhost|'  # localhost...
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # ...or ip
-        r'(?::\d+)?'  # optional port
+        r'^(?:http|ftp)s?://' # http:// or https://
+        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|' #domain...
+        r'localhost|' #localhost...
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})' # ...or ip
+        r'(?::\d+)?' # optional port
         r'(?:/?|[/?]\S+)$', re.IGNORECASE)
 
     def __init__(self, verify_exists=False, url_regex=None, **kwargs):
@@ -128,7 +125,8 @@ class URLField(StringField):
             warnings.warn(
                 "The URLField verify_exists argument has intractable security "
                 "and performance issues. Accordingly, it has been deprecated.",
-                DeprecationWarning)
+            DeprecationWarning
+            )
             try:
                 request = urllib2.Request(value)
                 urllib2.urlopen(request)
@@ -259,58 +257,30 @@ class FloatField(BaseField):
 class DecimalField(BaseField):
     """A fixed-point decimal number field.
 
-    .. versionchanged:: 0.8
     .. versionadded:: 0.3
     """
 
-    def __init__(self, min_value=None, max_value=None, force_string=False,
-                 precision=2, rounding=decimal.ROUND_HALF_UP, **kwargs):
-        """
-        :param min_value: Validation rule for the minimum acceptable value.
-        :param max_value: Validation rule for the maximum acceptable value.
-        :param force_string: Store as a string.
-        :param precision: Number of decimal places to store.
-        :param rounding: The rounding rule from the python decimal libary:
-
-            - decimial.ROUND_CEILING (towards Infinity)
-            - decimial.ROUND_DOWN (towards zero)
-            - decimial.ROUND_FLOOR (towards -Infinity)
-            - decimial.ROUND_HALF_DOWN (to nearest with ties going towards zero)
-            - decimial.ROUND_HALF_EVEN (to nearest with ties going to nearest even integer)
-            - decimial.ROUND_HALF_UP (to nearest with ties going away from zero)
-            - decimial.ROUND_UP (away from zero)
-            - decimial.ROUND_05UP (away from zero if last digit after rounding towards zero would have been 0 or 5; otherwise towards zero)
-
-            Defaults to: ``decimal.ROUND_HALF_UP``
-
-        """
-        self.min_value = min_value
-        self.max_value = max_value
-        self.force_string = force_string
-        self.precision = decimal.Decimal(".%s" % ("0" * precision))
-        self.rounding = rounding
-
+    def __init__(self, min_value=None, max_value=None, **kwargs):
+        self.min_value, self.max_value = min_value, max_value
         super(DecimalField, self).__init__(**kwargs)
 
     def to_python(self, value):
-        if value is None:
-            return value
-
-        # Convert to string for python 2.6 before casting to Decimal
-        value = decimal.Decimal("%s" % value)
-        return value.quantize(self.precision, rounding=self.rounding)
+        original_value = value
+        if not isinstance(value, basestring):
+            value = unicode(value)
+        try:
+            value = decimal.Decimal(value)
+        except ValueError:
+            return original_value
+        return value
 
     def to_mongo(self, value):
-        if value is None:
-            return value
-        if self.force_string:
-            return unicode(value)
-        return float(self.to_python(value))
+        return unicode(value)
 
     def validate(self, value):
         if not isinstance(value, decimal.Decimal):
             if not isinstance(value, basestring):
-                value = unicode(value)
+                value = str(value)
             try:
                 value = decimal.Decimal(value)
             except Exception, exc:
@@ -321,9 +291,6 @@ class DecimalField(BaseField):
 
         if self.max_value is not None and value > self.max_value:
             self.error('Decimal value is too large')
-
-    def prepare_query_value(self, op, value):
-        return self.to_mongo(value)
 
 
 class BooleanField(BaseField):
@@ -384,7 +351,7 @@ class DateTimeField(BaseField):
         kwargs = {'microsecond': usecs}
         try:  # Seconds are optional, so try converting seconds first.
             return datetime.datetime(*time.strptime(value,
-                                     '%Y-%m-%d %H:%M:%S')[:6], **kwargs)
+                                      '%Y-%m-%d %H:%M:%S')[:6], **kwargs)
         except ValueError:
             try:  # Try without seconds.
                 return datetime.datetime(*time.strptime(value,
@@ -468,7 +435,7 @@ class ComplexDateTimeField(StringField):
 
     def __get__(self, instance, owner):
         data = super(ComplexDateTimeField, self).__get__(instance, owner)
-        if data is None:
+        if data == None:
             return datetime.datetime.now()
         if isinstance(data, datetime.datetime):
             return data
@@ -657,15 +624,15 @@ class ListField(ComplexBaseField):
         """Make sure that a list of valid fields is being used.
         """
         if (not isinstance(value, (list, tuple, QuerySet)) or
-           isinstance(value, basestring)):
+            isinstance(value, basestring)):
             self.error('Only lists and tuples may be used in a list field')
         super(ListField, self).validate(value)
 
     def prepare_query_value(self, op, value):
         if self.field:
             if op in ('set', 'unset') and (not isinstance(value, basestring)
-               and not isinstance(value, BaseDocument)
-               and hasattr(value, '__iter__')):
+                and not isinstance(value, BaseDocument)
+                and hasattr(value, '__iter__')):
                 return [self.field.prepare_query_value(op, v) for v in value]
             return self.field.prepare_query_value(op, value)
         return super(ListField, self).prepare_query_value(op, value)
@@ -700,7 +667,7 @@ class SortedListField(ListField):
         value = super(SortedListField, self).to_mongo(value)
         if self._ordering is not None:
             return sorted(value, key=itemgetter(self._ordering),
-                          reverse=self._order_reverse)
+                                 reverse=self._order_reverse)
         return sorted(value, reverse=self._order_reverse)
 
 
@@ -781,7 +748,7 @@ class ReferenceField(BaseField):
       * NULLIFY     - Updates the reference to null.
       * CASCADE     - Deletes the documents associated with the reference.
       * DENY        - Prevent the deletion of the reference object.
-      * PULL        - Pull the reference from a :class:`~mongoengine.fields.ListField`
+      * PULL        - Pull the reference from a :class:`~mongoengine.ListField`
                       of references
 
     Alternative syntax for registering delete rules (useful when implementing
@@ -802,7 +769,7 @@ class ReferenceField(BaseField):
     .. versionchanged:: 0.5 added `reverse_delete_rule`
     """
 
-    def __init__(self, document_type, dbref=False,
+    def __init__(self, document_type, dbref=None,
                  reverse_delete_rule=DO_NOTHING, **kwargs):
         """Initialises the Reference Field.
 
@@ -816,7 +783,12 @@ class ReferenceField(BaseField):
                 self.error('Argument to ReferenceField constructor must be a '
                            'document class or a string')
 
-        self.dbref = dbref
+        # if dbref is None:
+        #     msg = ("ReferenceFields will default to using ObjectId "
+        #            "in 0.8, set DBRef=True if this isn't desired")
+        #     warnings.warn(msg, FutureWarning)
+
+        self.dbref = dbref if dbref is not None else True  # To change in 0.8
         self.document_type_obj = document_type
         self.reverse_delete_rule = reverse_delete_rule
         super(ReferenceField, self).__init__(**kwargs)
@@ -853,6 +825,8 @@ class ReferenceField(BaseField):
             if not self.dbref:
                 return document.id
             return document
+        elif not self.dbref and isinstance(document, basestring):
+            return document
 
         id_field_name = self.document_type._meta['id_field']
         id_field = self.document_type._fields[id_field_name]
@@ -877,7 +851,7 @@ class ReferenceField(BaseField):
         """Convert a MongoDB-compatible type to a Python type.
         """
         if (not self.dbref and
-           not isinstance(value, (DBRef, Document, EmbeddedDocument))):
+            not isinstance(value, (DBRef, Document, EmbeddedDocument))):
             collection = self.document_type._get_collection_name()
             value = DBRef(collection, self.document_type.id.to_python(value))
         return value
@@ -968,7 +942,13 @@ class GenericReferenceField(BaseField):
         id_ = id_field.to_mongo(id_)
         collection = document._get_collection_name()
         ref = DBRef(collection, id_)
-        return {'_cls': document._class_name, '_ref': ref}
+        """ add 'cls' and '_id' for backwards compatibility """
+        #return {'_cls': document._class_name, '_ref': ref}
+        package_name = 'promotion' if document._class_name.find('Promotion') != -1 else document._class_name.lower()
+        return {"_cls" : document._class_name,
+                "_ref" : ref,
+                "cls" : ('models.%s.%s' % (package_name, document.__class__.__name__)),
+                "_id" : id_}
 
     def prepare_query_value(self, op, value):
         if value is None:
@@ -998,7 +978,7 @@ class BinaryField(BaseField):
         if not isinstance(value, (bin_type, txt_type, Binary)):
             self.error("BinaryField only accepts instances of "
                        "(%s, %s, Binary)" % (
-                       bin_type.__name__, txt_type.__name__))
+                        bin_type.__name__, txt_type.__name__))
 
         if self.max_bytes is not None and len(value) > self.max_bytes:
             self.error('Binary value is too long')
@@ -1191,11 +1171,13 @@ class FileField(BaseField):
                     grid_file.delete()
                 except:
                     pass
-
-            # Create a new proxy object as we don't already have one
-            instance._data[key] = self.proxy_class(key=key, instance=instance,
-                                                   collection_name=self.collection_name)
-            instance._data[key].put(value)
+                # Create a new file with the new data
+                grid_file.put(value)
+            else:
+                # Create a new proxy object as we don't already have one
+                instance._data[key] = self.proxy_class(key=key, instance=instance,
+                                                       collection_name=self.collection_name)
+                instance._data[key].put(value)
         else:
             instance._data[key] = value
 
@@ -1259,7 +1241,10 @@ class ImageGridFsProxy(GridFSProxy):
             size = field.thumbnail_size
 
             if size['force']:
-                thumbnail = ImageOps.fit(img, (size['width'], size['height']), Image.ANTIALIAS)
+                thumbnail = ImageOps.fit(img,
+                                   (size['width'],
+                                    size['height']),
+                                   Image.ANTIALIAS)
             else:
                 thumbnail = img.copy()
                 thumbnail.thumbnail((size['width'],
@@ -1267,7 +1252,8 @@ class ImageGridFsProxy(GridFSProxy):
                                     Image.ANTIALIAS)
 
         if thumbnail:
-            thumb_id = self._put_thumbnail(thumbnail, img_format)
+            thumb_id = self._put_thumbnail(thumbnail,
+                                          img_format)
         else:
             thumb_id = None
 
@@ -1303,7 +1289,6 @@ class ImageGridFsProxy(GridFSProxy):
                            height=h,
                            format=format,
                            **kwargs)
-
     @property
     def size(self):
         """
@@ -1371,7 +1356,7 @@ class ImageField(FileField):
             if isinstance(att, (tuple, list)):
                 if PY3:
                     value = dict(itertools.zip_longest(params_size, att,
-                                                       fillvalue=None))
+                                                        fillvalue=None))
                 else:
                     value = dict(map(None, params_size, att))
 
@@ -1380,6 +1365,28 @@ class ImageField(FileField):
         super(ImageField, self).__init__(
             collection_name=collection_name,
             **kwargs)
+
+
+class GeoPointField(BaseField):
+    """A list storing a latitude and longitude.
+
+    .. versionadded:: 0.4
+    """
+
+    _geo_index = True
+
+    def validate(self, value):
+        """Make sure that a geo-value is of type (x, y)
+        """
+        if not isinstance(value, (list, tuple)):
+            self.error('GeoPointField can only accept tuples or lists '
+                       'of (x, y)')
+
+        if not len(value) == 2:
+            self.error('Value must be a two-dimensional point')
+        if (not isinstance(value[0], (float, int)) and
+            not isinstance(value[1], (float, int))):
+            self.error('Both values in point must be float or int')
 
 
 class SequenceField(BaseField):
@@ -1407,13 +1414,13 @@ class SequenceField(BaseField):
     COLLECTION_NAME = 'mongoengine.counters'
     VALUE_DECORATOR = int
 
-    def __init__(self, collection_name=None, db_alias=None, sequence_name=None,
-                 value_decorator=None, *args, **kwargs):
+    def __init__(self, collection_name=None, db_alias=None,
+            sequence_name=None, value_decorator=None, *args, **kwargs):
         self.collection_name = collection_name or self.COLLECTION_NAME
         self.db_alias = db_alias or DEFAULT_CONNECTION_NAME
         self.sequence_name = sequence_name
         self.value_decorator = (callable(value_decorator) and
-                                value_decorator or self.VALUE_DECORATOR)
+            value_decorator or self.VALUE_DECORATOR)
         return super(SequenceField, self).__init__(*args, **kwargs)
 
     def generate(self):
@@ -1423,38 +1430,18 @@ class SequenceField(BaseField):
         sequence_name = self.get_sequence_name()
         sequence_id = "%s.%s" % (sequence_name, self.name)
         collection = get_db(alias=self.db_alias)[self.collection_name]
-        counter = collection.find_and_modify(query={"_id": sequence_id},
-                                             update={"$inc": {"next": 1}},
-                                             new=True,
-                                             upsert=True)
-        return self.value_decorator(counter['next'])
-
-    def set_next_value(self, value):
-        """Helper method to set the next sequence value"""
-        sequence_name = self.get_sequence_name()
-        sequence_id = "%s.%s" % (sequence_name, self.name)
-        collection = get_db(alias=self.db_alias)[self.collection_name]
-        counter = collection.find_and_modify(query={"_id": sequence_id},
-                                             update={"$set": {"next": value}},
-                                             new=True,
-                                             upsert=True)
-        return self.value_decorator(counter['next'])
-
-    def get_next_value(self):
-        """Helper method to get the next value for previewing.
-
-        .. warning:: There is no guarantee this will be the next value
-        as it is only fixed on set.
-        """
-        sequence_name = self.get_sequence_name()
-        sequence_id = "%s.%s" % (sequence_name, self.name)
-        collection = get_db(alias=self.db_alias)[self.collection_name]
-        data = collection.find_one({"_id": sequence_id})
-
-        if data:
-            return self.value_decorator(data['next']+1)
-
-        return self.value_decorator(1)
+        # counter = collection.find_and_modify(query={"_id": sequence_id},
+        #                                     update={"$inc": {"next": 1}},
+        #                                     new=True,
+        #                                     upsert=True)
+        # return counter['next']
+        # SpotOn Fix
+        counter = collection.find_and_modify(query={self.name: {'$exists': True}},
+                                            update={"$inc": {self.name: 1}},
+                                            new=True,
+                                            upsert=True)
+        
+        return self.value_decorator(counter[self.name])
 
     def get_sequence_name(self):
         if self.sequence_name:
@@ -1464,7 +1451,7 @@ class SequenceField(BaseField):
             return owner._get_collection_name()
         else:
             return ''.join('_%s' % c if c.isupper() else c
-                           for c in owner._class_name).strip('_').lower()
+                            for c in owner._class_name).strip('_').lower()
 
     def __get__(self, instance, owner):
         value = super(SequenceField, self).__get__(instance, owner)
@@ -1495,15 +1482,19 @@ class UUIDField(BaseField):
     """
     _binary = None
 
-    def __init__(self, binary=True, **kwargs):
+    def __init__(self, binary=None, **kwargs):
         """
         Store UUID data in the database
 
-        :param binary: if False store as a string.
+        :param binary: (optional) boolean store as binary.
 
-        .. versionchanged:: 0.8.0
         .. versionchanged:: 0.6.19
         """
+        if binary is None:
+            binary = False
+            msg = ("UUIDFields will soon default to store as binary, please "
+                  "configure binary=False if you wish to store as a string")
+            warnings.warn(msg, FutureWarning)
         self._binary = binary
         super(UUIDField, self).__init__(**kwargs)
 
@@ -1521,8 +1512,6 @@ class UUIDField(BaseField):
     def to_mongo(self, value):
         if not self._binary:
             return unicode(value)
-        elif isinstance(value, basestring):
-            return uuid.UUID(value)
         return value
 
     def prepare_query_value(self, op, value):
@@ -1538,83 +1527,3 @@ class UUIDField(BaseField):
                 value = uuid.UUID(value)
             except Exception, exc:
                 self.error('Could not convert to UUID: %s' % exc)
-
-
-class GeoPointField(BaseField):
-    """A list storing a latitude and longitude.
-
-    .. versionadded:: 0.4
-    """
-
-    _geo_index = pymongo.GEO2D
-
-    def validate(self, value):
-        """Make sure that a geo-value is of type (x, y)
-        """
-        if not isinstance(value, (list, tuple)):
-            self.error('GeoPointField can only accept tuples or lists '
-                       'of (x, y)')
-
-        if not len(value) == 2:
-            self.error("Value (%s) must be a two-dimensional point" % repr(value))
-        elif (not isinstance(value[0], (float, int)) or
-              not isinstance(value[1], (float, int))):
-            self.error("Both values (%s) in point must be float or int" % repr(value))
-
-
-class PointField(GeoJsonBaseField):
-    """A geo json field storing a latitude and longitude.
-
-    The data is represented as:
-
-    .. code-block:: js
-
-        { "type" : "Point" ,
-          "coordinates" : [x, y]}
-
-    You can either pass a dict with the full information or a list
-    to set the value.
-
-    Requires mongodb >= 2.4
-    .. versionadded:: 0.8
-    """
-    _type = "Point"
-
-
-class LineStringField(GeoJsonBaseField):
-    """A geo json field storing a line of latitude and longitude coordinates.
-
-    The data is represented as:
-
-    .. code-block:: js
-
-        { "type" : "LineString" ,
-          "coordinates" : [[x1, y1], [x1, y1] ... [xn, yn]]}
-
-    You can either pass a dict with the full information or a list of points.
-
-    Requires mongodb >= 2.4
-    .. versionadded:: 0.8
-    """
-    _type = "LineString"
-
-
-class PolygonField(GeoJsonBaseField):
-    """A geo json field storing a polygon of latitude and longitude coordinates.
-
-    The data is represented as:
-
-    .. code-block:: js
-
-        { "type" : "Polygon" ,
-          "coordinates" : [[[x1, y1], [x1, y1] ... [xn, yn]],
-                           [[x1, y1], [x1, y1] ... [xn, yn]]}
-
-    You can either pass a dict with the full information or a list
-    of LineStrings. The first LineString being the outside and the rest being
-    holes.
-
-    Requires mongodb >= 2.4
-    .. versionadded:: 0.8
-    """
-    _type = "Polygon"
